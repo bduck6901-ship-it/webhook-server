@@ -20,7 +20,7 @@ BTC/USDT 선물 자동매매 봇 - 웹훅 버전 (최종)
   → 1차 TP 취소
   → 전체 포지션 평균단가 기준
     · TP: 전체 수량의 50% / 0.3%
-    · SL: 전체 수량 100% / 0.5%
+    · SL: 전체 수량 100% / 0.3%
 
 [수동 개입 감지]
   - 봇 주문 외 수량 변동 감지 시 즉시 모든 자동 명령 중단
@@ -50,7 +50,7 @@ SYMBOL              = "BTC/USDT:USDT"
 LEVERAGE            = 100
 MARGIN_MODE         = "isolated"
 ENTRY_RATIO         = 0.05      # 1회 진입 비율 (잔고의 5%)
-STOP_LOSS_PCT       = 0.005     # 손절 0.5%
+STOP_LOSS_PCT       = 0.003     # 손절 0.3%
 TAKE_PROFIT_PCT     = 0.003     # 익절 0.3%
 SECOND_ENTRY_OFFSET = 200       # 2차 지정가 오프셋 ($200)
 MONITOR_INTERVAL    = 10        # 모니터링 루프 간격 (초)
