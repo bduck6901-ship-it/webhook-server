@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: btc-oi-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn webhook_bot:app --workers 1 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: BINGX_API_KEY
+        sync: false
+      - key: BINGX_API_SECRET
+        sync: false
+      - key: WEBHOOK_TOKEN
+        sync: false
