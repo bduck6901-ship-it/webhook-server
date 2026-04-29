@@ -213,12 +213,37 @@ def place_market_order(exchange, side, usdt_amount):
 
 
 # ─────────────────────────────────────────
-# TP 주문 설정 (수량의 50%만)
+# 1차 TP 주문 설정 (전체 수량 100%)
+# ─────────────────────────────────────────
+def set_tp_order_full(exchange, side, ref_price, full_qty):
+    """
+    1차 진입 시 전체 수량 100% TP로 설정합니다.
+    TP 도달 시 전량 익절 후 봇 재시작.
+    """
+    try:
+        close_side = "sell" if side == "buy" else "buy"
+        tp_price   = ref_price * (1 + TAKE_PROFIT_PCT) if side == "buy" \
+                     else ref_price * (1 - TAKE_PROFIT_PCT)
+        tp_price   = float(exchange.price_to_precision(SYMBOL, tp_price))
+
+        tp_order = exchange.create_order(
+            SYMBOL, "TAKE_PROFIT_MARKET", close_side, full_qty,
+            params={"stopPrice": tp_price, "reduceOnly": True}
+        )
+        log.info(f"  📈 1차 TP 설정: {tp_price:.2f} USDT  수량: {full_qty} BTC (전체 100%)")
+        return tp_order.get("id") if tp_order else None
+    except Exception as e:
+        log.error(f"1차 TP 설정 실패: {e}")
+        return None
+
+
+# ─────────────────────────────────────────
+# 2차 TP 주문 설정 (수량의 50%만)
 # ─────────────────────────────────────────
 def set_tp_order(exchange, side, ref_price, full_qty):
     """
-    전체 수량의 50%만 TP로 설정합니다.
-    ref_price: TP 기준 가격 (진입가 or 평균단가)
+    2차 진입 후 전체 수량의 50%만 TP로 설정합니다.
+    ref_price: 평균단가 기준
     """
     try:
         close_side = "sell" if side == "buy" else "buy"
@@ -231,10 +256,10 @@ def set_tp_order(exchange, side, ref_price, full_qty):
             SYMBOL, "TAKE_PROFIT_MARKET", close_side, tp_qty,
             params={"stopPrice": tp_price, "reduceOnly": True}
         )
-        log.info(f"  📈 TP 설정: {tp_price:.2f} USDT  수량: {tp_qty} BTC (전체의 50%)")
+        log.info(f"  📈 2차 TP 설정: {tp_price:.2f} USDT  수량: {tp_qty} BTC (전체의 50%)")
         return tp_order.get("id") if tp_order else None
     except Exception as e:
-        log.error(f"TP 설정 실패: {e}")
+        log.error(f"2차 TP 설정 실패: {e}")
         return None
 
 
@@ -362,13 +387,13 @@ def monitor_loop():
             # ════════════════════════════════════
             if entry_count == 1:
 
-                # 1차 TP 50% 체결 확인
+                # 1차 TP 전체 체결 확인
                 if tp_order_id:
                     tp_status = get_order_status(exchange, tp_order_id)
                     if tp_status == "closed":
-                        log.info("🎉 1차 TP 50% 체결! → 2차 지정가 취소 → 나머지 50% 수동 관리")
+                        log.info("🎉 1차 TP 전체 체결! → 2차 지정가 취소 → 처음부터 재시작")
                         cancel_order_safe(exchange, limit_order_id)
-                        # 남은 50% 수량은 수동 관리 → 봇 비활성화
+                        cancel_all_open_orders(exchange)
                         reset_state()
                         continue
 
@@ -503,8 +528,8 @@ def webhook():
 
         qty = float(order.get("filled") or order.get("amount") or 0)
 
-        # ── 1차 TP 설정 (수량의 50%, SL 없음) ──
-        tp_order_id = set_tp_order(exchange, order_side, entry_price, qty)
+        # ── 1차 TP 설정 (전체 수량 100%, SL 없음) ──
+        tp_order_id = set_tp_order_full(exchange, order_side, entry_price, qty)
 
         # ── 2차 지정가 예약 ──
         limit_order_id, limit_qty = place_second_limit_order(
@@ -523,12 +548,12 @@ def webhook():
             state["tp_order_id"]    = tp_order_id
             state["limit_order_id"] = limit_order_id
             state["sl_order_id"]    = None
-            state["expected_qty"]   = qty       # 1차 수량만 관리
+            state["expected_qty"]   = qty
             state["last_signal"]    = datetime.now().isoformat()
 
         log.info(f"🎯 1차 {dir_kr} 진입 완료")
         log.info(f"  진입가: {entry_price:.2f}  수량: {qty} BTC")
-        log.info(f"  TP (50%): {qty * TP_PARTIAL_RATIO:.4f} BTC")
+        log.info(f"  TP (100%): {qty:.4f} BTC → TP 체결 시 전량 익절 후 재시작")
         log.info(f"  2차 지정가 대기: {second_price:.2f} USDT")
 
         return jsonify({
