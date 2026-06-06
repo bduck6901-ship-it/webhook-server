@@ -77,10 +77,13 @@ state = {
     "manual_pause":     False,   # 수동 개입으로 일시 중단 여부
     "entry_count":      0,       # 체결된 진입 횟수
     "side":             None,    # "buy" or "sell"
-    "tp_order_id":      None,    # 현재 TP 주문 ID
+    "tp_order_id":      None,    # 현재 TP1 주문 ID (2차: 50% / 0.3%)
+    "tp2_order_id":     None,    # TP2 주문 ID (2차: 30% / 0.5%)
     "limit_order_id":   None,    # 2차 지정가 주문 ID
-    "sl_order_id":      None,    # SL 주문 ID (2차 후 설정)
+    "sl_order_id":      None,    # SL 주문 ID
     "expected_qty":     0.0,     # 봇이 관리하는 총 예상 수량
+    "avg_price":        0.0,     # 2차 진입 후 평균단가 (본전 SL용)
+    "total_qty":        0.0,     # 2차 진입 후 전체 수량 (비율 계산용)
     "last_signal":      None,
 }
 
@@ -185,9 +188,12 @@ def reset_state(manual_pause=False):
         state["entry_count"]    = 0
         state["side"]           = None
         state["tp_order_id"]    = None
+        state["tp2_order_id"]   = None
         state["limit_order_id"] = None
         state["sl_order_id"]    = None
         state["expected_qty"]   = 0.0
+        state["avg_price"]      = 0.0
+        state["total_qty"]      = 0.0
     if manual_pause:
         log.warning("⏸️  수동 개입 감지 → 봇 일시 중단 (포지션 청산 후 자동 재시작)")
     else:
@@ -281,6 +287,25 @@ def set_sl_order(exchange, side, avg_price, total_qty):
         return sl_order.get("id") if sl_order else None
     except Exception as e:
         log.error(f"SL 설정 실패: {e}")
+        return None
+
+
+# ─────────────────────────────────────────
+# 본전 SL 설정 (TP1 체결 후 SL을 평단가로 이동)
+# ─────────────────────────────────────────
+def set_sl_order_breakeven(exchange, side, avg_price, qty):
+    try:
+        close_side = "sell" if side == "buy" else "buy"
+        sl_price   = float(exchange.price_to_precision(SYMBOL, avg_price))
+
+        sl_order = exchange.create_order(
+            SYMBOL, "STOP_MARKET", close_side, qty,
+            params={"stopPrice": sl_price, "reduceOnly": True}
+        )
+        log.info(f"  📉 본전 SL 이동: {sl_price:.2f} USDT (평단가 기준)  수량: {qty} BTC")
+        return sl_order.get("id") if sl_order else None
+    except Exception as e:
+        log.error(f"본전 SL 설정 실패: {e}")
         return None
 
 
@@ -427,6 +452,8 @@ def monitor_loop():
                             state["sl_order_id"]    = new_sl_id
                             state["limit_order_id"] = None
                             state["expected_qty"]   = total_qty
+                            state["avg_price"]      = avg_price
+                            state["total_qty"]      = total_qty
                         continue
 
             # ════════════════════════════════════
@@ -434,20 +461,84 @@ def monitor_loop():
             # ════════════════════════════════════
             elif entry_count == 2:
 
-                # TP 50% 체결 확인
+                with state_lock:
+                    tp2_order_id = state["tp2_order_id"]
+                    avg_price    = state["avg_price"]
+                    total_qty    = state["total_qty"]
+
+                # ── TP1 50% 체결 확인 (평단 0.3%) ──
                 if tp_order_id:
                     tp_status = get_order_status(exchange, tp_order_id)
                     if tp_status == "closed":
-                        log.info("🎉 2차 TP 50% 체결! → 나머지 50% + SL은 유지, 수동 관리")
-                        # SL은 그대로 유지, 봇은 종료
-                        reset_state()
+                        log.info("🎉 2차 TP1 50% 체결! → SL 본전으로 이동 + TP2 0.5% 예약")
+
+                        # 기존 SL 취소
+                        cancel_order_safe(exchange, sl_order_id)
+
+                        # 잔여 수량 확인 (전체의 50% 남음)
+                        remaining_qty = float(exchange.amount_to_precision(
+                            SYMBOL, total_qty * 0.5
+                        ))
+
+                        # TP2: 잔여 수량의 60% (전체의 30%) / 평단 기준 0.5%
+                        tp2_qty = float(exchange.amount_to_precision(
+                            SYMBOL, total_qty * 0.3
+                        ))
+                        close_side = "sell" if side == "buy" else "buy"
+                        tp2_price  = avg_price * (1 + 0.005) if side == "buy"                                      else avg_price * (1 - 0.005)
+                        tp2_price  = float(exchange.price_to_precision(SYMBOL, tp2_price))
+
+                        tp2_order = exchange.create_order(
+                            SYMBOL, "TAKE_PROFIT_MARKET", close_side, tp2_qty,
+                            params={"stopPrice": tp2_price, "reduceOnly": True}
+                        )
+                        new_tp2_id = tp2_order.get("id") if tp2_order else None
+                        log.info(f"  📈 TP2 설정: {tp2_price:.2f} USDT  수량: {tp2_qty} BTC (전체의 30%)")
+
+                        # SL 본전(평균단가)으로 이동
+                        new_sl_id = set_sl_order_breakeven(exchange, side, avg_price, remaining_qty)
+
+                        with state_lock:
+                            state["entry_count"]  = 3
+                            state["tp_order_id"]  = None
+                            state["tp2_order_id"] = new_tp2_id
+                            state["sl_order_id"]  = new_sl_id
+                            state["expected_qty"] = remaining_qty
                         continue
 
                 # SL 체결 확인
                 if sl_order_id:
                     sl_status = get_order_status(exchange, sl_order_id)
                     if sl_status == "closed":
-                        log.info("📉 SL 체결 → 포지션 청산 완료")
+                        log.info("📉 2차 SL 체결 → 포지션 청산 완료")
+                        cancel_all_open_orders(exchange)
+                        reset_state()
+                        continue
+
+            # ════════════════════════════════════
+            # 3단계: TP2 + 본전 SL 모니터링
+            # (2차 TP1 익절 후 남은 20% 관리)
+            # ════════════════════════════════════
+            elif entry_count == 3:
+
+                with state_lock:
+                    tp2_order_id = state["tp2_order_id"]
+                    sl_order_id2 = state["sl_order_id"]
+
+                # TP2 30% 체결 확인 (평단 0.5%)
+                if tp2_order_id:
+                    tp2_status = get_order_status(exchange, tp2_order_id)
+                    if tp2_status == "closed":
+                        log.info("🎉 TP2 30% 체결! → 남은 20% + 본전 SL 유지 → 봇 종료")
+                        # 남은 20%는 본전 SL만 걸린 상태 → 봇 비활성화
+                        reset_state()
+                        continue
+
+                # 본전 SL 체결 확인
+                if sl_order_id2:
+                    sl2_status = get_order_status(exchange, sl_order_id2)
+                    if sl2_status == "closed":
+                        log.info("📉 본전 SL 체결 → 잔여 포지션 청산 완료")
                         cancel_all_open_orders(exchange)
                         reset_state()
                         continue
@@ -471,6 +562,9 @@ def webhook():
     }
     """
     try:
+        log.info(f"Content-Type: {request.content_type}")
+        log.info(f"Headers: {dict(request.headers)}")
+        log.info(f"Raw Data: {request.data}")
         data = request.get_json()
         log.info(f"웹훅 수신: {data}")
 
