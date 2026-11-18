@@ -5,9 +5,13 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn webhook_bot:app --workers 1 --bind 0.0.0.0:$PORT
     envVars:
-      - key: BINGX_API_KEY
+      - key: BITGET_API_KEY
         sync: false
-      - key: BINGX_API_SECRET
+      - key: BITGET_API_SECRET
         sync: false
+      - key: BITGET_PASSPHRASE
+        sync: false
+      - key: BITGET_HEDGE_MODE
+        value: "false"
       - key: WEBHOOK_TOKEN
         sync: false
