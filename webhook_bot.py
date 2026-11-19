@@ -13,6 +13,9 @@ BTC/USDT 선물 자동매매 봇 - 웹훅 버전 (최종)
   - 익절(가격 기준): 15분 TP1 +0.3% / TP2 +0.5%, 1시간 TP1 +0.5% / TP2 +0.7% / TP3 +1.0%, 4시간 TP1 +0.7% / TP2 +1.0% / TP3 +1.3%
   - 손절: 15분은 평단 기준 -0.3% (고정 비율 진입), 1시간·4시간은 위의 계산된 손절가
   - 진입 조건: 거래소에 포지션이 전혀 없을 때만 자동 진입 (수동 포지션·조회 실패 시에도 진입 안 함)
+  - 손절 쿨다운: SL 로 끝난 청산(본전 SL 포함) 후에는 그 시간봉 시나리오만 4시간 동안 신호 무시 (다른 시간봉은 그대로)
+  - 상태 저장(D): 진행 상태·쿨다운을 파일(STATE_FILE)에 저장하고, 재시작 시 복구 (영구 디스크가 있어야 재배포 후에도 유지)
+  - 모니터링 간격(C): 5초 (환경변수 MONITOR_INTERVAL 로 조정, 거래소 연결은 재사용하고 오류 시에만 재생성)
   - 안전장치 A: 2차 체결 후 손절(SL) 설정 실패 → 즉시 시장가 전량 청산
   - 안전장치 B: 2차 지정가 예약 실패 → 1차 포지션에 보호용 손절 설정(실패 시 즉시 청산)
   - 안전 상한: 자동 계산 수량의 합계 증거금이 잔고의 50%를 넘으면 수량을 줄임
@@ -55,6 +58,7 @@ BTC/USDT 선물 자동매매 봇 - 웹훅 버전 (최종)
 """
 
 import ccxt
+import json
 import logging
 import os
 import time
@@ -118,7 +122,11 @@ TIMEFRAME_ALIASES = {
 # 손절은 "가격 변동 기준" (레버리지 적용 전) - 모든 시나리오 공통
 # 익절(TP1/TP2)은 위 SCENARIOS 에서 시간봉별로 설정
 STOP_LOSS_PCT       = 0.003     # 손절 가격 -0.3%
-MONITOR_INTERVAL    = 10        # 모니터링 루프 간격 (초)
+MONITOR_INTERVAL    = float(os.environ.get("MONITOR_INTERVAL", "5"))  # 모니터링 루프 간격 (초, 환경변수로 조정 가능)
+# 상태 저장 파일. Render 에서 재배포·재시작 후에도 유지하려면 유료 플랜의 Disk 를 /var/data 에 붙이고
+# 환경변수 STATE_FILE=/var/data/bot_state.json 으로 지정하세요. (디스크가 없으면 프로세스 재시작까지만 유지)
+STATE_FILE          = os.environ.get("STATE_FILE", "bot_state.json")
+COOLDOWN_AFTER_SL   = 4 * 3600  # SL 로 청산된 시나리오는 이 시간(초) 동안 신호 무시
 
 # ─────────────────────────────────────────
 # 📋 로깅 설정
@@ -157,7 +165,53 @@ state = {
 }
 
 state_lock = threading.Lock()
+# 시간봉별 쿨다운 종료 시각 (epoch 초). 서버 재시작 시 초기화됨 (안정장치 D 와 함께 저장 예정)
+cooldown_until = {}
 app = Flask(__name__)
+
+
+# ─────────────────────────────────────────
+# 상태 저장 / 복구 (안정장치 D)
+# ─────────────────────────────────────────
+_last_saved = None
+
+
+def save_state():
+    """현재 상태를 파일에 저장 (임시 파일에 쓰고 교체해서 쓰다 끊겨도 깨지지 않게). 내용이 같으면 건너뜀"""
+    global _last_saved
+    try:
+        with state_lock:
+            payload = {"state": dict(state), "cooldown_until": dict(cooldown_until)}
+        snapshot = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if snapshot == _last_saved:
+            return
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(snapshot)
+        os.replace(tmp, STATE_FILE)
+        _last_saved = snapshot
+    except Exception as e:
+        log.warning(f"상태 저장 실패: {e}")
+
+
+def load_state():
+    """시작할 때 저장된 상태를 복구. 거래소와의 불일치는 모니터링 루프가 바로잡음
+    (상태는 진행 중인데 포지션이 없으면 초기화, 포지션이 있으면 주문 ID 로 이어서 관리)"""
+    try:
+        if not os.path.exists(STATE_FILE):
+            return
+        with open(STATE_FILE, encoding="utf-8") as f:
+            payload = json.load(f)
+        saved = payload.get("state", {})
+        with state_lock:
+            for k in state:
+                if k in saved:
+                    state[k] = saved[k]
+            state["entering"] = False
+            cooldown_until.update({k: float(v) for k, v in payload.get("cooldown_until", {}).items()})
+        log.info(f"💾 저장된 상태 복구: active={state['active']} 단계={state['entry_count']} 시간봉={state['timeframe']}")
+    except Exception as e:
+        log.warning(f"상태 복구 실패 (무시하고 새로 시작): {e}")
 
 
 # ─────────────────────────────────────────
@@ -344,10 +398,29 @@ def reset_state(manual_pause=False):
         state["allowed_qtys"]   = []
         state["timeframe"]      = None
         state["sl_price"]       = None
+    save_state()
     if manual_pause:
         log.warning("⏸️  수동 개입 감지 → 봇 일시 중단 (포지션 청산 후 자동 재시작)")
     else:
         log.info("🔄 상태 초기화 완료 → 다음 신호 대기 중")
+
+
+# ─────────────────────────────────────────
+# 손절 쿨다운
+# ─────────────────────────────────────────
+def start_cooldown(tf_key):
+    if not tf_key:
+        return
+    with state_lock:
+        cooldown_until[tf_key] = time.time() + COOLDOWN_AFTER_SL
+    save_state()
+    name = SCENARIOS.get(tf_key, {}).get("name", tf_key)
+    log.warning(f"⏳ [{name}] SL 청산 → {COOLDOWN_AFTER_SL // 3600}시간 동안 이 시간봉 신호 무시")
+
+
+def cooldown_remaining(tf_key):
+    with state_lock:
+        return max(0.0, cooldown_until.get(tf_key, 0.0) - time.time())
 
 
 # ─────────────────────────────────────────
@@ -596,10 +669,13 @@ def detect_manual_intervention(position):
 # ─────────────────────────────────────────
 def monitor_loop():
     log.info("🔍 모니터링 스레드 시작")
+    exchange = None   # 거래소 연결은 재사용 (3초마다 새로 만들면 시장 정보를 매번 다시 받아 느려짐)
     while True:
         try:
             time.sleep(MONITOR_INTERVAL)
-            exchange = get_exchange()
+            save_state()   # 직전 반복에서 바뀐 상태 저장
+            if exchange is None:
+                exchange = get_exchange()
 
             with state_lock:
                 is_active      = state["active"]
@@ -630,6 +706,11 @@ def monitor_loop():
             # ── 포지션 없음: 모두 청산됨 ──
             if not position:
                 log.info("📭 포지션 없음 → 미체결 주문 정리 후 초기화")
+                # 마지막 SL 주문이 체결돼서 끝난 청산이면 해당 시간봉 쿨다운 시작
+                if sl_order_id and get_order_status(exchange, sl_order_id) == "closed":
+                    with state_lock:
+                        stopped_tf = state["timeframe"]
+                    start_cooldown(stopped_tf)
                 cancel_all_open_orders(exchange)
                 reset_state()
                 continue
@@ -659,6 +740,9 @@ def monitor_loop():
                 # 보호용 SL(안전장치 B) 체결 확인
                 if sl_order_id and get_order_status(exchange, sl_order_id) == "closed":
                     log.info("📉 1차 보호용 SL 체결 → 포지션 청산 완료")
+                    with state_lock:
+                        start_tf = state["timeframe"]
+                    start_cooldown(start_tf)
                     cancel_all_open_orders(exchange)
                     reset_state()
                     continue
@@ -786,6 +870,9 @@ def monitor_loop():
                     sl_status = get_order_status(exchange, sl_order_id)
                     if sl_status == "closed":
                         log.info("📉 2차 SL 체결 → 포지션 청산 완료")
+                        with state_lock:
+                            start_tf = state["timeframe"]
+                        start_cooldown(start_tf)
                         cancel_all_open_orders(exchange)
                         reset_state()
                         continue
@@ -847,6 +934,9 @@ def monitor_loop():
                     sl2_status = get_order_status(exchange, sl_order_id2)
                     if sl2_status == "closed":
                         log.info("📉 본전 SL 체결 → 잔여 포지션 청산 완료")
+                        with state_lock:
+                            start_tf = state["timeframe"]
+                        start_cooldown(start_tf)
                         cancel_all_open_orders(exchange)
                         reset_state()
                         continue
@@ -893,6 +983,7 @@ def monitor_loop():
 
         except Exception as e:
             log.error(f"모니터링 루프 오류: {e}")
+            exchange = None   # 연결 문제일 수 있으니 다음 반복에서 새로 연결
 
 
 # ─────────────────────────────────────────
@@ -940,6 +1031,13 @@ def webhook():
             log.warning(f"❌ {msg}")
             return jsonify({"error": msg}), 400
         scenario = SCENARIOS[tf_key]
+
+        # ── 손절 쿨다운 중인 시간봉이면 무시 ──
+        remain = cooldown_remaining(tf_key)
+        if remain > 0:
+            msg = f"[{scenario['name']}] 손절 쿨다운 중 (남은 시간 {remain / 60:.0f}분). 신호 무시."
+            log.info(msg)
+            return jsonify({"status": "skipped", "reason": msg}), 200
 
         candle_high = float(candle_high)
         candle_low  = float(candle_low)
@@ -1054,6 +1152,7 @@ def webhook():
             state["timeframe"]      = tf_key
             state["sl_price"]       = plan["sl_price"]
             state["last_signal"]    = datetime.now().isoformat()
+        save_state()
 
         log.info(f"🎯 [{scenario['name']}] 1차 {dir_kr} 진입 완료")
         log.info(f"  진입가: {entry_price:.2f}  수량: {qty} BTC")
@@ -1110,6 +1209,7 @@ def status():
         return jsonify({
             "balance_usdt": balance,
             "bot_state":    current_state,
+            "cooldown_minutes_left": {k: round(cooldown_remaining(k) / 60, 1) for k in SCENARIOS},
             "position":     pos_info,
         }), 200
 
@@ -1130,7 +1230,9 @@ def manual_reset():
         exchange = get_exchange()
         cancel_all_open_orders(exchange)
         reset_state()
-        return jsonify({"status": "ok", "message": "수동 초기화 완료"}), 200
+        with state_lock:
+            cooldown_until.clear()
+        return jsonify({"status": "ok", "message": "수동 초기화 완료 (쿨다운도 해제)"}), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1154,6 +1256,7 @@ def start_monitor():
     log.info("🔍 모니터링 스레드 가동")
 
 
+load_state()
 start_monitor()
 
 
