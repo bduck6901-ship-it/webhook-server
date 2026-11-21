@@ -13,7 +13,7 @@ BTC/USDT 선물 자동매매 봇 - 웹훅 버전 (최종)
   - 익절(가격 기준): 15분 TP1 +0.3% / TP2 +0.5%, 1시간 TP1 +0.5% / TP2 +0.7% / TP3 +1.0%, 4시간 TP1 +0.7% / TP2 +1.0% / TP3 +1.3%
   - 손절: 15분은 평단 기준 -0.3% (고정 비율 진입), 1시간·4시간은 위의 계산된 손절가
   - 진입 조건: 거래소에 포지션이 전혀 없을 때만 자동 진입 (수동 포지션·조회 실패 시에도 진입 안 함)
-  - 손절 쿨다운: SL 로 끝난 청산(본전 SL 포함) 후에는 그 시간봉 시나리오만 4시간 동안 신호 무시 (다른 시간봉은 그대로)
+  - 청산 쿨다운: 포지션이 완전히 청산되면(익절·손절·본전 손절 모두) 그 시간봉 시나리오만 4시간 동안 신호 무시 (다른 시간봉은 그대로)
   - 상태 저장(D): 진행 상태·쿨다운을 파일(STATE_FILE)에 저장하고, 재시작 시 복구 (영구 디스크가 있어야 재배포 후에도 유지)
   - 모니터링 간격(C): 5초 (환경변수 MONITOR_INTERVAL 로 조정, 거래소 연결은 재사용하고 오류 시에만 재생성)
   - 안전장치 A: 2차 체결 후 손절(SL) 설정 실패 → 즉시 시장가 전량 청산
@@ -112,6 +112,11 @@ SCENARIOS = {
 # 자동 수량 계산 시 안전 상한: 1·2차 합계 증거금이 잔고의 이 비율을 넘지 않게 수량을 줄임
 # (줄어들면 손실도 목표보다 작아지므로 안전한 쪽)
 MAX_TOTAL_MARGIN_RATIO = 0.5
+# ── 보호 없는 포지션 감시 ──
+# ① 봇이 관리 중인데 필요한 보호 주문(TP/SL)이 상태에 없으면 GRACE 초 후 즉시 청산
+# ② 미실현 손실이 '계획 손절 손실 × LOSS_CAP_MULT' 이상이면 즉시 청산 (손절이 안 걸렸거나 크게 미끄러진 경우의 최후 방어선)
+WATCHDOG_GRACE = float(os.environ.get("WATCHDOG_GRACE", "30"))
+LOSS_CAP_MULT  = float(os.environ.get("LOSS_CAP_MULT", "1.2"))
 
 # 웹훅 timeframe 값 → 시나리오 키 (트뷰 {{interval}} 은 15 / 60 / 240 으로 옴)
 TIMEFRAME_ALIASES = {
@@ -126,7 +131,7 @@ MONITOR_INTERVAL    = float(os.environ.get("MONITOR_INTERVAL", "5"))  # 모니�
 # 상태 저장 파일. Render 에서 재배포·재시작 후에도 유지하려면 유료 플랜의 Disk 를 /var/data 에 붙이고
 # 환경변수 STATE_FILE=/var/data/bot_state.json 으로 지정하세요. (디스크가 없으면 프로세스 재시작까지만 유지)
 STATE_FILE          = os.environ.get("STATE_FILE", "bot_state.json")
-COOLDOWN_AFTER_SL   = 4 * 3600  # SL 로 청산된 시나리오는 이 시간(초) 동안 신호 무시
+COOLDOWN_AFTER_SL   = 4 * 3600  # 포지션이 청산된 시나리오는 이 시간(초) 동안 신호 무시 (익절·손절 공통)
 
 # ─────────────────────────────────────────
 # 📋 로깅 설정
@@ -160,6 +165,7 @@ state = {
     "total_qty":        0.0,     # 2차 진입 후 전체 수량 (비율 계산용)
     "timeframe":        None,    # 현재 진행 중인 시나리오 (15m / 1h / 4h)
     "sl_price":         None,    # 신호 시점에 계산한 손절가 (risk 시나리오만, 없으면 평단 기준)
+    "planned_loss":     0.0,     # 계획한 손절 시 손실(USDT) - 최대 손실 한도 계산용
     "last_signal":      None,
     "entering":         False,   # 진입 처리 중 (동시에 알림 2개가 와도 중복 진입 방지)
 }
@@ -301,6 +307,14 @@ def get_balance(exchange):
 # ─────────────────────────────────────────
 # 포지션 조회
 # ─────────────────────────────────────────
+def get_position_strict(exchange):
+    """조회 실패 시 예외를 그대로 던짐. 모니터링에서 '조회 실패'를 '포지션 없음'으로 오인하지 않기 위해 사용"""
+    for pos in exchange.fetch_positions([SYMBOL]):
+        if abs(float(pos.get("contracts") or 0)) > 0:
+            return pos
+    return None
+
+
 def get_position(exchange):
     try:
         positions = exchange.fetch_positions([SYMBOL])
@@ -398,6 +412,7 @@ def reset_state(manual_pause=False):
         state["allowed_qtys"]   = []
         state["timeframe"]      = None
         state["sl_price"]       = None
+        state["planned_loss"]   = 0.0
     save_state()
     if manual_pause:
         log.warning("⏸️  수동 개입 감지 → 봇 일시 중단 (포지션 청산 후 자동 재시작)")
@@ -406,7 +421,7 @@ def reset_state(manual_pause=False):
 
 
 # ─────────────────────────────────────────
-# 손절 쿨다운
+# 청산 쿨다운
 # ─────────────────────────────────────────
 def start_cooldown(tf_key):
     if not tf_key:
@@ -415,7 +430,7 @@ def start_cooldown(tf_key):
         cooldown_until[tf_key] = time.time() + COOLDOWN_AFTER_SL
     save_state()
     name = SCENARIOS.get(tf_key, {}).get("name", tf_key)
-    log.warning(f"⏳ [{name}] SL 청산 → {COOLDOWN_AFTER_SL // 3600}시간 동안 이 시간봉 신호 무시")
+    log.warning(f"⏳ [{name}] 포지션 청산 → {COOLDOWN_AFTER_SL // 3600}시간 동안 이 시간봉 신호 무시")
 
 
 def cooldown_remaining(tf_key):
@@ -519,6 +534,45 @@ def place_market_order(exchange, side, usdt_amount=None, qty=None):
         log.error(f"시장가 주문 실패: {e}")
         return None, None
 
+
+
+def resolve_fill(exchange, order, requested_qty, fallback_price):
+    """시장가 주문 직후 실제 체결 수량·평균가를 확인.
+    Bitget 은 주문 생성 응답에 filled/average 를 주지 않는 경우가 있어(수량 0 으로 읽히는 문제),
+    ① 응답값 → ② fetch_order → ③ 실제 포지션 → ④ 요청 수량 순으로 확인한다."""
+    qty, avg = 0.0, None
+    try:
+        qty = float(order.get("filled") or 0)
+        avg = order.get("average") or order.get("price")
+    except Exception:
+        pass
+    if qty <= 0 and order.get("id"):
+        for _ in range(3):
+            try:
+                o = exchange.fetch_order(order["id"], SYMBOL)
+                qty = float(o.get("filled") or 0)
+                avg = o.get("average") or o.get("price") or avg
+                if qty > 0:
+                    break
+            except Exception as e:
+                log.warning(f"체결 조회 재시도: {e}")
+            time.sleep(0.4)
+    if qty <= 0:
+        try:
+            pos = get_position_strict(exchange)
+            if pos:
+                qty = abs(float(pos.get("contracts") or 0))
+                avg = pos.get("entryPrice") or avg
+        except Exception as e:
+            log.warning(f"포지션으로 체결 수량 확인 실패: {e}")
+    if qty <= 0:
+        qty = float(requested_qty)   # 시장가는 전량 체결이 일반적이므로 요청 수량 사용
+        log.warning(f"체결 수량을 확인하지 못해 요청 수량 사용: {qty}")
+    try:
+        avg = float(avg) if avg else float(fallback_price)
+    except Exception:
+        avg = float(fallback_price)
+    return float(exchange.amount_to_precision(SYMBOL, qty)), avg
 
 # ─────────────────────────────────────────
 # 1차 TP 주문 설정 (전체 수량 100%)
@@ -670,6 +724,7 @@ def detect_manual_intervention(position):
 def monitor_loop():
     log.info("🔍 모니터링 스레드 시작")
     exchange = None   # 거래소 연결은 재사용 (3초마다 새로 만들면 시장 정보를 매번 다시 받아 느려짐)
+    unprotected_since = None   # 보호 주문이 없는 상태가 시작된 시각
     while True:
         try:
             time.sleep(MONITOR_INTERVAL)
@@ -688,7 +743,7 @@ def monitor_loop():
 
             # ── 수동 중단 상태: 포지션 완전 청산 대기 후 재시작 ──
             if is_paused:
-                position = get_position(exchange)
+                position = get_position_strict(exchange)
                 if not position:
                     log.info("✅ 포지션 완전 청산 확인 → 봇 자동 재시작 대기 중")
                     reset_state(manual_pause=False)
@@ -698,22 +753,56 @@ def monitor_loop():
 
             # ── 비활성 상태면 스킵 ──
             if not is_active:
+                unprotected_since = None
                 continue
 
-            # ── 포지션 조회 ──
-            position = get_position(exchange)
+            # ── 포지션 조회 (실패하면 예외 → 이번 반복 건너뜀. 실패를 '포지션 없음'으로 보면 안 됨) ──
+            position = get_position_strict(exchange)
 
             # ── 포지션 없음: 모두 청산됨 ──
             if not position:
                 log.info("📭 포지션 없음 → 미체결 주문 정리 후 초기화")
-                # 마지막 SL 주문이 체결돼서 끝난 청산이면 해당 시간봉 쿨다운 시작
-                if sl_order_id and get_order_status(exchange, sl_order_id) == "closed":
-                    with state_lock:
-                        stopped_tf = state["timeframe"]
-                    start_cooldown(stopped_tf)
+                # 익절·손절 어느 쪽으로 끝났든 해당 시간봉 쿨다운 시작
+                with state_lock:
+                    closed_tf = state["timeframe"]
+                start_cooldown(closed_tf)
                 cancel_all_open_orders(exchange)
                 reset_state()
                 continue
+
+            # ── 보호 없는 포지션 감시 ──
+            with state_lock:
+                wd_tf     = state["timeframe"]
+                wd_loss   = state["planned_loss"]
+            # 단계별로 있어야 하는 보호 주문 (1단계: 전량 TP 또는 보호 SL / 2단계 이상: SL)
+            if entry_count <= 1:
+                protected = bool(tp_order_id or sl_order_id)
+            else:
+                protected = bool(sl_order_id)
+            if protected:
+                unprotected_since = None
+            else:
+                if unprotected_since is None:
+                    unprotected_since = time.time()
+                    log.warning(f"⚠️ 보호 주문 없는 포지션 감지 → {WATCHDOG_GRACE:.0f}초 안에 복구되지 않으면 청산")
+                elif time.time() - unprotected_since >= WATCHDOG_GRACE:
+                    emergency_close(exchange, side, "보호 주문(TP/SL) 없는 포지션 감시")
+                    start_cooldown(wd_tf)
+                    reset_state()
+                    unprotected_since = None
+                    continue
+            # 최대 손실 한도: 미실현 손실이 계획 손절 손실의 LOSS_CAP_MULT 배 이상이면 청산
+            try:
+                upnl = position.get("unrealizedPnl")
+                if upnl is not None and wd_loss and float(upnl) <= -wd_loss * LOSS_CAP_MULT:
+                    emergency_close(exchange, side,
+                                    f"최대 손실 한도 도달 (미실현 {float(upnl):.2f} USDT ≤ -{wd_loss * LOSS_CAP_MULT:.2f})")
+                    start_cooldown(wd_tf)
+                    reset_state()
+                    unprotected_since = None
+                    continue
+            except Exception as e:
+                log.warning(f"손실 한도 확인 오류: {e}")
 
             # ── 수동 개입 감지 ──
             if detect_manual_intervention(position):
@@ -732,6 +821,9 @@ def monitor_loop():
                     tp_status = get_order_status(exchange, tp_order_id)
                     if tp_status == "closed":
                         log.info("🎉 1차 TP 전체 체결! → 2차 지정가 취소 → 처음부터 재시작")
+                        with state_lock:
+                            tp_tf = state["timeframe"]
+                        start_cooldown(tp_tf)
                         cancel_order_safe(exchange, limit_order_id)
                         cancel_all_open_orders(exchange)
                         reset_state()
@@ -1035,7 +1127,7 @@ def webhook():
         # ── 손절 쿨다운 중인 시간봉이면 무시 ──
         remain = cooldown_remaining(tf_key)
         if remain > 0:
-            msg = f"[{scenario['name']}] 손절 쿨다운 중 (남은 시간 {remain / 60:.0f}분). 신호 무시."
+            msg = f"[{scenario['name']}] 청산 쿨다운 중 (남은 시간 {remain / 60:.0f}분). 신호 무시."
             log.info(msg)
             return jsonify({"status": "skipped", "reason": msg}), 200
 
@@ -1112,11 +1204,26 @@ def webhook():
         if not order or not entry_price:
             return jsonify({"status": "error", "reason": "1차 시장가 주문 실패"}), 500
 
-        qty = float(order.get("filled") or order.get("amount") or 0)
+        # 실제 체결 수량·평균가 확인 (응답에 값이 없어도 0 으로 읽지 않도록)
+        qty, entry_price = resolve_fill(exchange, order, plan["first_qty"], entry_price)
+        if qty <= 0:
+            emergency_close(exchange, order_side, "1차 체결 수량 확인 불가")
+            reset_state()
+            return jsonify({"status": "error", "reason": "체결 수량 확인 실패 → 긴급 청산"}), 500
 
         # ── 1차 TP 설정 (전체 수량 100%, SL 없음) ──
         tp_order_id = set_tp_order_full(exchange, order_side, entry_price, qty,
                                         scenario["tp1_pct"])
+        if not tp_order_id:
+            time.sleep(0.5)
+            tp_order_id = set_tp_order_full(exchange, order_side, entry_price, qty,
+                                            scenario["tp1_pct"])
+        if not tp_order_id:
+            # 익절 주문 없이 포지션을 두면 봇이 관리할 수 없으므로 즉시 정리
+            log.error("❗ 1차 TP 설정 실패(재시도 포함) → 긴급 청산")
+            emergency_close(exchange, order_side, "1차 TP 설정 실패")
+            reset_state()
+            return jsonify({"status": "error", "reason": "1차 TP 설정 실패 → 긴급 청산"}), 500
 
         # ── 2차 지정가 예약 ──
         limit_order_id, limit_qty = place_second_limit_order(
@@ -1151,6 +1258,7 @@ def webhook():
             state["allowed_qtys"]   = [qty, qty + limit_qty] if limit_order_id else [qty]
             state["timeframe"]      = tf_key
             state["sl_price"]       = plan["sl_price"]
+            state["planned_loss"]   = float(plan["est_loss_usdt"] or 0.0)
             state["last_signal"]    = datetime.now().isoformat()
         save_state()
 
