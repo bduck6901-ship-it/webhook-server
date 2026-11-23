@@ -119,6 +119,18 @@ MAX_TOTAL_MARGIN_RATIO = 0.5
 WATCHDOG_GRACE = float(os.environ.get("WATCHDOG_GRACE", "30"))
 LOSS_CAP_MULT  = float(os.environ.get("LOSS_CAP_MULT", "1.2"))
 
+# ── 동시 신호 우선순위 ──
+# 1h·4h(·15m) 알림이 같은 순간 겹쳐 오면 가장 큰 시간봉 하나만 진입 (4h > 1h > 15m)
+# 4h 는 더 큰 봉이 없으므로 기다리지 않고 즉시 진입, 그 외는 SIGNAL_WINDOW 초 동안 더 큰 봉 신호를 기다림
+# ── 2차 지정가 기준 ──
+# True : 1차 진입가(평단) 기준으로 second_offset 만큼 불리한 쪽 (롱: 아래, 숏: 위)
+# False: 신호 캔들의 저점/고점 기준으로 second_offset 만큼 바깥 (예전 방식)
+SECOND_FROM_ENTRY = os.environ.get("SECOND_FROM_ENTRY", "true").lower() == "true"
+SIGNAL_WINDOW = float(os.environ.get("SIGNAL_WINDOW", "3"))
+TF_PRIORITY   = {"15m": 1, "1h": 2, "4h": 3}
+# 레버리지·마진 설정은 매 진입마다 하지 않고 SETUP_TTL 초 동안 재사용 (진입 속도 개선)
+SETUP_TTL     = float(os.environ.get("SETUP_TTL", "43200"))
+
 # 웹훅 timeframe 값 → 시나리오 키 (트뷰 {{interval}} 은 15 / 60 / 240 으로 옴)
 TIMEFRAME_ALIASES = {
     "15": "15m", "15m": "15m",
@@ -252,6 +264,18 @@ def setup_leverage(exchange):
         except Exception as e:
             log.warning(f"{name} 설정 경고: {e}")
     log.info(f"레버리지 {LEVERAGE}배 / {MARGIN_MODE} 설정 시도 완료")
+
+
+_setup_done_at = 0.0
+
+
+def ensure_setup(exchange):
+    """레버리지/마진 설정을 SETUP_TTL 안에는 다시 하지 않음 (신호→진입 지연 단축)"""
+    global _setup_done_at
+    if time.time() - _setup_done_at < SETUP_TTL:
+        return
+    setup_leverage(exchange)
+    _setup_done_at = time.time()
 
 
 def trigger_params(kind, price, extra=None):
@@ -479,7 +503,10 @@ def compute_order_plan(scenario, side, price, candle_high, candle_low, balance):
     w2 = 1.0 - w1
     offset = scenario["second_offset"]
 
-    limit_price = (candle_low - offset) if side == "buy" else (candle_high + offset)
+    if SECOND_FROM_ENTRY:
+        limit_price = (price - offset) if side == "buy" else (price + offset)
+    else:
+        limit_price = (candle_low - offset) if side == "buy" else (candle_high + offset)
 
     # 2차 지정가는 현재가보다 불리한 쪽(롱: 아래, 숏: 위)에 있어야 정상
     if side == "buy" and limit_price >= price:
@@ -685,7 +712,10 @@ def place_second_limit_order(exchange, side, candle_high, candle_low, usdt_amoun
 
         limit_order = exchange.create_limit_order(SYMBOL, side, qty, limit_price)
 
-        label = f"저점 - ${offset}" if side == "buy" else f"고점 + ${offset}"
+        if SECOND_FROM_ENTRY:
+            label = f"1차 진입가 - ${offset}" if side == "buy" else f"1차 진입가 + ${offset}"
+        else:
+            label = f"저점 - ${offset}" if side == "buy" else f"고점 + ${offset}"
         log.info(f"  📌 2차 지정가 예약: {limit_price:.2f} USDT ({label})")
         return limit_order.get("id") if limit_order else None, qty
     except Exception as e:
@@ -1102,6 +1132,55 @@ def monitor_loop():
 # ─────────────────────────────────────────
 # 웹훅 엔드포인트
 # ─────────────────────────────────────────
+# ─────────────────────────────────────────
+# 웹훅 수신 → 큐 → 워커 (동시에 온 신호 중 가장 큰 시간봉 우선)
+# ─────────────────────────────────────────
+pending_signals = []
+pending_lock    = threading.Lock()
+last_signal_result = {"tf": None, "code": None}   # 마지막으로 처리된 신호 (디버그·테스트용)
+
+
+def drain_signals(force=False):
+    """대기 중인 신호를 처리. 가장 큰 시간봉 1개만 진입, 나머지는 버림. 처리했으면 True"""
+    with pending_lock:
+        if not pending_signals:
+            return False
+        top_pri  = max(TF_PRIORITY[x["tf"]] for x in pending_signals)
+        waited   = time.time() - min(x["t"] for x in pending_signals)
+        # 가장 큰 봉(4h)이 이미 와 있으면 기다릴 필요 없음
+        if not force and top_pri < max(TF_PRIORITY.values()) and waited < SIGNAL_WINDOW:
+            return False
+        batch = list(pending_signals)
+        pending_signals.clear()
+    # 우선순위 높은 순, 같으면 먼저 도착한 것
+    batch.sort(key=lambda x: (-TF_PRIORITY[x["tf"]], x["t"]))
+    best = batch[0]
+    for x in batch[1:]:
+        log.info(f"⏭ [{SCENARIOS[x['tf']]['name']}] 신호 무시 - 더 큰 시간봉 [{SCENARIOS[best['tf']]['name']}] 신호 우선")
+    with app.app_context():
+        try:
+            body, code = process_signal(best["data"])
+            last_signal_result["tf"], last_signal_result["code"] = best["tf"], code
+            log.info(f"신호 처리 결과 [{SCENARIOS[best['tf']]['name']}] {code}")
+        except Exception as e:
+            log.error(f"신호 처리 오류: {e}")
+    return True
+
+
+def signal_worker():
+    log.info("📨 신호 처리 스레드 시작")
+    try:
+        ensure_setup(get_exchange())      # 첫 신호가 빨리 들어가도록 미리 설정
+    except Exception as e:
+        log.warning(f"초기 레버리지 설정 경고: {e}")
+    while True:
+        try:
+            drain_signals()
+        except Exception as e:
+            log.error(f"신호 워커 오류: {e}")
+        time.sleep(0.25)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """
@@ -1113,8 +1192,8 @@ def webhook():
         "candle_high":  {{high}},
         "candle_low":   {{low}}
     }
+    즉시 200 으로 응답하고, 실제 진입은 신호 워커가 처리합니다.
     """
-    got_entry_lock = False
     try:
         log.info(f"Content-Type: {request.content_type}")
         log.info(f"Headers: {dict(request.headers)}")
@@ -1122,11 +1201,33 @@ def webhook():
         data = request.get_json()
         log.info(f"웹훅 수신: {data}")
 
-        # ── 보안 토큰 검증 ──
         if not data or data.get("token") != WEBHOOK_TOKEN:
             log.warning("❌ 유효하지 않은 토큰")
             return jsonify({"error": "Unauthorized"}), 401
 
+        if str(data.get("direction", "")).lower() not in ("long", "short"):
+            return jsonify({"error": "direction 값이 잘못됨 (long/short)"}), 400
+        if data.get("candle_high") is None or data.get("candle_low") is None:
+            return jsonify({"error": "candle_high / candle_low 값이 필요합니다"}), 400
+        tf_raw = str(data.get("timeframe", "")).strip().lower()
+        tf_key = TIMEFRAME_ALIASES.get(tf_raw)
+        if tf_key is None:
+            msg = f"timeframe 값이 없거나 잘못됨: '{tf_raw}' (15 / 60 / 240 중 하나여야 함)"
+            log.warning(f"❌ {msg}")
+            return jsonify({"error": msg}), 400
+
+        with pending_lock:
+            pending_signals.append({"tf": tf_key, "data": data, "t": time.time()})
+        return jsonify({"status": "queued", "timeframe": tf_key}), 200
+    except Exception as e:
+        log.error(f"웹훅 수신 오류: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def process_signal(data):
+    """큐에서 뽑힌 신호 하나를 실제로 처리 (진입). 반환값은 (json, 상태코드)"""
+    got_entry_lock = False
+    try:
         direction   = data.get("direction", "").lower()
         candle_high = data.get("candle_high")
         candle_low  = data.get("candle_low")
@@ -1192,7 +1293,7 @@ def webhook():
             log.warning(msg)
             return jsonify({"status": "skipped", "reason": msg}), 200
 
-        setup_leverage(exchange)
+        ensure_setup(exchange)
 
         # ── 잔고 조회 ──
         balance     = get_balance(exchange)
@@ -1247,13 +1348,16 @@ def webhook():
             return jsonify({"status": "error", "reason": "1차 TP 설정 실패 → 긴급 청산"}), 500
 
         # ── 2차 지정가 예약 ──
+        # 진입가 기준이면 실제 체결된 1차 평단으로 위치를 다시 계산 (수량 계획은 그대로)
+        second_price = plan["limit_price"]
+        if SECOND_FROM_ENTRY:
+            second_price = (entry_price - scenario["second_offset"]) if order_side == "buy" \
+                           else (entry_price + scenario["second_offset"])
         limit_order_id, limit_qty = place_second_limit_order(
             exchange, order_side, candle_high, candle_low, None,
             scenario["second_offset"],
-            qty=plan["second_qty"], limit_price=plan["limit_price"]
+            qty=plan["second_qty"], limit_price=second_price
         )
-
-        second_price = plan["limit_price"]
 
         # ── 안전장치 B: 2차 지정가 예약 실패 → 1차 포지션을 손절 없이 두지 않음 ──
         protective_sl_id = None
@@ -1382,6 +1486,7 @@ def start_monitor():
         return
     _monitor_started = True
     threading.Thread(target=monitor_loop, daemon=True).start()
+    threading.Thread(target=signal_worker, daemon=True).start()
     log.info("🔍 모니터링 스레드 가동")
 
 
