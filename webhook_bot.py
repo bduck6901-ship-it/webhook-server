@@ -98,7 +98,8 @@ MARGIN_MODE         = "isolated"
 #                            이때 first_ratio : second_ratio 는 1차/2차 분배 비율로만 쓰임
 SCENARIOS = {
     "15m": {"name": "15분",  "sizing": "fixed", "first_ratio": 0.10, "second_ratio": 0.05, "second_offset": 200, "tp1_pct": 0.003, "tp2_pct": 0.005,
-            "tp1_close_ratio": 0.50, "tp2_close_ratio": 0.30},
+            "tp1_close_ratio": 0.50, "tp2_close_ratio": 0.50,   # TP2 = 남은 전량 (꼬리 없음)
+            "tp_limit": True},   # 익절은 전부 지정가(reduceOnly, 메이커). 손절·안전장치만 시장가
     "1h":  {"name": "1시간", "sizing": "risk",  "first_ratio": 0.07, "second_ratio": 0.05, "second_offset": 500, "tp1_pct": 0.005, "tp2_pct": 0.007,
             "tp1_close_ratio": 0.20, "tp2_close_ratio": 0.30,
             "tp3_pct": 0.010, "tp3_close_ratio": 0.30,
@@ -264,7 +265,16 @@ def trigger_params(kind, price, extra=None):
     return params
 
 
-def create_trigger_order(exchange, kind, close_side, qty, price):
+def create_trigger_order(exchange, kind, close_side, qty, price, limit=None):
+    # 시나리오가 tp_limit 이면 익절은 트리거 시장가 대신 지정가(reduceOnly)로 건다
+    # limit 을 직접 주면 그 값 사용(진입 직후엔 state 의 시간봉이 아직 갱신 전이라)
+    if limit is None:
+        limit = bool(current_scenario().get("tp_limit"))
+    if kind == "tp" and limit:
+        params = {"reduceOnly": True}
+        if HEDGE_MODE:
+            params["hedged"] = True
+        return exchange.create_order(SYMBOL, "limit", close_side, qty, price, params)
     return exchange.create_order(SYMBOL, "market", close_side, qty, None, trigger_params(kind, price))
 
 
@@ -577,7 +587,7 @@ def resolve_fill(exchange, order, requested_qty, fallback_price):
 # ─────────────────────────────────────────
 # 1차 TP 주문 설정 (전체 수량 100%)
 # ─────────────────────────────────────────
-def set_tp_order_full(exchange, side, ref_price, full_qty, tp_pct):
+def set_tp_order_full(exchange, side, ref_price, full_qty, tp_pct, limit=None):
     """
     1차 진입 시 전체 수량 100% TP로 설정합니다.
     TP 도달 시 전량 익절 후 봇 재시작.
@@ -588,7 +598,7 @@ def set_tp_order_full(exchange, side, ref_price, full_qty, tp_pct):
                      else ref_price * (1 - tp_pct)
         tp_price   = float(exchange.price_to_precision(SYMBOL, tp_price))
 
-        tp_order = create_trigger_order(exchange, "tp", close_side, full_qty, tp_price)
+        tp_order = create_trigger_order(exchange, "tp", close_side, full_qty, tp_price, limit)
         log.info(f"  📈 1차 TP 설정: {tp_price:.2f} USDT  수량: {full_qty} BTC (전체 100%)")
         return tp_order.get("id") if tp_order else None
     except Exception as e:
@@ -865,6 +875,15 @@ def monitor_loop():
                                                  sc["tp1_pct"], sc["tp1_close_ratio"])
                         with state_lock:
                             planned_sl = state["sl_price"]
+                        # 위험 기반 시나리오: 2차 체결 후 '실제 평단·실제 수량' 기준으로 손절가를 다시 계산
+                        # → 손절 시 손실이 계획 손실(잔고 대비 risk_pct)에 정확히 맞음
+                        with state_lock:
+                            _pl = state["planned_loss"]
+                        if sc.get("sizing") == "risk" and _pl and total_qty > 0:
+                            _d = _pl / total_qty
+                            _px = avg_price - _d if side == "buy" else avg_price + _d
+                            if _px > 0:
+                                planned_sl = _px
                         new_sl_id = set_sl_order(exchange, side, avg_price, total_qty, planned_sl)
                         if not new_sl_id:
                             # 안전장치 A: 손절 설정 실패 → 손절 없는 포지션을 두지 않고 즉시 청산
@@ -918,6 +937,8 @@ def monitor_loop():
                         tp2_qty = float(exchange.amount_to_precision(
                             SYMBOL, total_qty * r2
                         ))
+                        if r1 + r2 >= 0.999:      # TP2 가 남은 전량이면 반올림 잔량이 남지 않게 맞춤
+                            tp2_qty = remaining_qty
                         close_side = "sell" if side == "buy" else "buy"
                         tp2_pct    = current_scenario()["tp2_pct"]
                         tp2_price  = avg_price * (1 + tp2_pct) if side == "buy" \
@@ -1213,11 +1234,11 @@ def webhook():
 
         # ── 1차 TP 설정 (전체 수량 100%, SL 없음) ──
         tp_order_id = set_tp_order_full(exchange, order_side, entry_price, qty,
-                                        scenario["tp1_pct"])
+                                        scenario["tp1_pct"], bool(scenario.get("tp_limit")))
         if not tp_order_id:
             time.sleep(0.5)
             tp_order_id = set_tp_order_full(exchange, order_side, entry_price, qty,
-                                            scenario["tp1_pct"])
+                                            scenario["tp1_pct"], bool(scenario.get("tp_limit")))
         if not tp_order_id:
             # 익절 주문 없이 포지션을 두면 봇이 관리할 수 없으므로 즉시 정리
             log.error("❗ 1차 TP 설정 실패(재시도 포함) → 긴급 청산")
