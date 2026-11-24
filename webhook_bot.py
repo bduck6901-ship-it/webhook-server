@@ -555,6 +555,22 @@ def compute_order_plan(scenario, side, price, candle_high, candle_low, balance):
 # ─────────────────────────────────────────
 # 시장가 주문
 # ─────────────────────────────────────────
+def market_limits(exchange):
+    """거래소가 알려주는 최소 주문 수량(BTC)·최소 주문 금액(USDT). 못 읽으면 보수적 기본값"""
+    min_amt, min_cost = 0.0001, 5.0
+    try:
+        lim = (exchange.market(SYMBOL) or {}).get("limits") or {}
+        a = (lim.get("amount") or {}).get("min")
+        c = (lim.get("cost") or {}).get("min")
+        if a:
+            min_amt = float(a)
+        if c:
+            min_cost = float(c)
+    except Exception as e:
+        log.warning(f"거래소 최소 주문 조건 조회 실패 → 기본값 사용: {e}")
+    return min_amt, min_cost
+
+
 def place_market_order(exchange, side, usdt_amount=None, qty=None):
     """qty 를 직접 주면 그 수량으로, 없으면 usdt_amount 로 계산해서 주문"""
     try:
@@ -1170,7 +1186,10 @@ def drain_signals(force=False):
 def signal_worker():
     log.info("📨 신호 처리 스레드 시작")
     try:
-        ensure_setup(get_exchange())      # 첫 신호가 빨리 들어가도록 미리 설정
+        ex0 = get_exchange()
+        ensure_setup(ex0)                 # 첫 신호가 빨리 들어가도록 미리 설정
+        ma, mc = market_limits(ex0)
+        log.info(f"📏 거래소 최소 주문: {ma} BTC / {mc} USDT")
     except Exception as e:
         log.warning(f"초기 레버리지 설정 경고: {e}")
     last_beat = time.time()
@@ -1312,9 +1331,13 @@ def process_signal(data):
             log.warning(f"❌ 주문 계획 계산 실패: {e}")
             return jsonify({"status": "skipped", "reason": str(e)}), 400
 
-        first_margin = plan["first_qty"] * cur_price / LEVERAGE
-        if first_margin < 5:
-            msg = f"잔고 부족 (1차 증거금 {first_margin:.2f} USDT)"
+        # ── 거래소 최소 주문 조건 확인 (1·2차 모두 최소 수량·최소 금액 이상이어야 함) ──
+        min_amt, min_cost = market_limits(exchange)
+        q1 = float(exchange.amount_to_precision(SYMBOL, plan["first_qty"]))
+        q2 = float(exchange.amount_to_precision(SYMBOL, plan["second_qty"]))
+        if q1 < min_amt or q2 < min_amt or q1 * cur_price < min_cost or q2 * cur_price < min_cost:
+            msg = (f"잔고 부족: 1차 {q1} / 2차 {q2} BTC 가 거래소 최소 "
+                   f"({min_amt} BTC · {min_cost} USDT) 미달")
             log.warning(msg)
             return jsonify({"status": "skipped", "reason": msg}), 200
 
