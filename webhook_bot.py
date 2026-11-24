@@ -1173,9 +1173,13 @@ def signal_worker():
         ensure_setup(get_exchange())      # 첫 신호가 빨리 들어가도록 미리 설정
     except Exception as e:
         log.warning(f"초기 레버리지 설정 경고: {e}")
+    last_beat = time.time()
     while True:
         try:
             drain_signals()
+            if time.time() - last_beat >= 300:
+                last_beat = time.time()
+                log.info(f"💓 신호 워커 동작 중 (대기 {len(pending_signals)}건)")
         except Exception as e:
             log.error(f"신호 워커 오류: {e}")
         time.sleep(0.25)
@@ -1218,6 +1222,8 @@ def webhook():
 
         with pending_lock:
             pending_signals.append({"tf": tf_key, "data": data, "t": time.time()})
+            n_pending = len(pending_signals)
+        log.info(f"📥 신호 대기열 추가: {tf_key} (대기 {n_pending}건)")
         return jsonify({"status": "queued", "timeframe": tf_key}), 200
     except Exception as e:
         log.error(f"웹훅 수신 오류: {e}")
@@ -1423,6 +1429,7 @@ def process_signal(data):
 @app.route("/status", methods=["GET"])
 def status():
     try:
+        threads = thread_info()
         exchange = get_exchange()
         position = get_position(exchange)
         balance  = get_balance(exchange)
@@ -1444,10 +1451,11 @@ def status():
             "bot_state":    current_state,
             "cooldown_minutes_left": {k: round(cooldown_remaining(k) / 60, 1) for k in SCENARIOS},
             "position":     pos_info,
+            "threads":      threads,
         }), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "threads": thread_info()}), 500
 
 
 # ─────────────────────────────────────────
@@ -1477,17 +1485,40 @@ def manual_reset():
 # 스레드가 돌지 않습니다. 모듈 로드 시점에 한 번만 시작합니다.
 # ※ 상태를 메모리에 두므로 gunicorn은 반드시 --workers 1 로 실행하세요.
 # ─────────────────────────────────────────
-_monitor_started = False
+_threads = {"pid": None, "monitor": None, "worker": None}
+_start_lock = threading.Lock()
+AUTOSTART_THREADS = True      # 테스트에서만 False
 
 
 def start_monitor():
-    global _monitor_started
-    if _monitor_started:
-        return
-    _monitor_started = True
-    threading.Thread(target=monitor_loop, daemon=True).start()
-    threading.Thread(target=signal_worker, daemon=True).start()
-    log.info("🔍 모니터링 스레드 가동")
+    """감시·신호 처리 스레드가 '현재 프로세스'에서 살아 있도록 보장.
+    gunicorn --preload 등으로 프로세스가 복제되면 스레드는 복제되지 않으므로,
+    요청이 들어올 때마다(before_request) 다시 확인해서 필요하면 새로 시작한다."""
+    with _start_lock:
+        pid = os.getpid()
+        if _threads["pid"] != pid:
+            _threads["pid"], _threads["monitor"], _threads["worker"] = pid, None, None
+        for key, fn in (("monitor", monitor_loop), ("worker", signal_worker)):
+            t = _threads[key]
+            if t is None or not t.is_alive():
+                t = threading.Thread(target=fn, daemon=True, name=key)
+                t.start()
+                _threads[key] = t
+                log.info(f"🧵 {key} 스레드 가동 (pid {pid})")
+
+
+@app.before_request
+def _ensure_threads():
+    if AUTOSTART_THREADS:
+        start_monitor()
+
+
+def thread_info():
+    def alive(k):
+        t = _threads[k]
+        return bool(t is not None and t.is_alive())
+    return {"pid": os.getpid(), "monitor_alive": alive("monitor"), "worker_alive": alive("worker"),
+            "pending_signals": len(pending_signals), "last_signal": dict(last_signal_result)}
 
 
 load_state()
