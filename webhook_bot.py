@@ -99,15 +99,16 @@ MARGIN_MODE         = "isolated"
 SCENARIOS = {
     "15m": {"name": "15분",  "sizing": "fixed", "first_ratio": 0.10, "second_ratio": 0.05, "second_offset": 200, "tp1_pct": 0.003, "tp2_pct": 0.005,
             "tp1_close_ratio": 0.50, "tp2_close_ratio": 0.50,   # TP2 = 남은 전량 (꼬리 없음)
-            "tp_limit": True},   # 익절은 전부 지정가(reduceOnly, 메이커). 손절·안전장치만 시장가
+            "tp_limit": True,    # 익절은 전부 지정가
+            "cooldown_only_on_stop": True},   # 쿨다운은 손절·안전장치 청산 때만 (익절로 끝나면 바로 다음 신호 진입 가능)(reduceOnly, 메이커). 손절·안전장치만 시장가
     "1h":  {"name": "1시간", "sizing": "risk",  "first_ratio": 0.07, "second_ratio": 0.05, "second_offset": 500, "tp1_pct": 0.005, "tp2_pct": 0.007,
             "tp1_close_ratio": 0.20, "tp2_close_ratio": 0.30,
             "tp3_pct": 0.010, "tp3_close_ratio": 0.30,
-            "risk_pct": 0.01, "sl_buffer_pct": 0.008},
+            "risk_pct": 0.01, "sl_buffer_pct": 0.008, "tp_limit": True},
     "4h":  {"name": "4시간", "sizing": "risk",  "first_ratio": 0.05, "second_ratio": 0.05, "second_offset": 700, "tp1_pct": 0.007, "tp2_pct": 0.010,
             "tp1_close_ratio": 0.15, "tp2_close_ratio": 0.30,
             "tp3_pct": 0.013, "tp3_close_ratio": 0.20,
-            "risk_pct": 0.03, "sl_buffer_pct": 0.010},
+            "risk_pct": 0.03, "sl_buffer_pct": 0.010, "tp_limit": True},
 }
 
 # 자동 수량 계산 시 안전 상한: 1·2차 합계 증거금이 잔고의 이 비율을 넘지 않게 수량을 줄임
@@ -390,11 +391,21 @@ def get_order_status(exchange, order_id):
                 return order.get("status")
         except Exception:
             pass
-    open_list = list_open_orders(exchange)
-    if open_list is None:
-        return None
-    if any(o["id"] == order_id for o in open_list):
-        return "open"
+    # 방금 낸 주문은 거래소 조회에 늦게 반영될 수 있어 → 한 번 더 확인 후에만 '체결됨'으로 판단
+    for attempt in range(2):
+        open_list = list_open_orders(exchange)
+        if open_list is None:
+            return None
+        if any(o["id"] == order_id for o in open_list):
+            return "open"
+        if attempt == 0:
+            time.sleep(2)
+            try:
+                order = exchange.fetch_order(order_id, SYMBOL, {})
+                if order and order.get("status"):
+                    return order.get("status")
+            except Exception:
+                pass
     return "closed"
 
 
@@ -465,6 +476,14 @@ def start_cooldown(tf_key):
     save_state()
     name = SCENARIOS.get(tf_key, {}).get("name", tf_key)
     log.warning(f"⏳ [{name}] 포지션 청산 → {COOLDOWN_AFTER_SL // 3600}시간 동안 이 시간봉 신호 무시")
+
+
+def cooldown_after_profit(tf_key):
+    """익절(이익)로 끝났을 때의 쿨다운. cooldown_only_on_stop 시나리오는 쿨다운 없음"""
+    if tf_key and SCENARIOS.get(tf_key, {}).get("cooldown_only_on_stop"):
+        log.info(f"✅ [{SCENARIOS[tf_key]['name']}] 익절로 종료 → 쿨다운 없음 (손절일 때만 쉼)")
+        return
+    start_cooldown(tf_key)
 
 
 def cooldown_remaining(tf_key):
@@ -818,10 +837,20 @@ def monitor_loop():
             # ── 포지션 없음: 모두 청산됨 ──
             if not position:
                 log.info("📭 포지션 없음 → 미체결 주문 정리 후 초기화")
-                # 익절·손절 어느 쪽으로 끝났든 해당 시간봉 쿨다운 시작
+                # 기본: 익절·손절 어느 쪽으로 끝났든 해당 시간봉 쿨다운 시작
+                # (cooldown_only_on_stop 시나리오는 익절로 끝난 게 확인될 때만 쿨다운 생략)
                 with state_lock:
                     closed_tf = state["timeframe"]
-                start_cooldown(closed_tf)
+                profit_exit = False
+                if SCENARIOS.get(closed_tf, {}).get("cooldown_only_on_stop"):
+                    if entry_count >= 3:        # TP1 이후 단계 = 이미 이익 실현됨 (본전 청산 포함)
+                        profit_exit = True
+                    elif tp_order_id and get_order_status(exchange, tp_order_id) == "closed":
+                        profit_exit = True      # 1차 전량 TP 또는 TP1 체결
+                if profit_exit:
+                    cooldown_after_profit(closed_tf)
+                else:
+                    start_cooldown(closed_tf)
                 cancel_all_open_orders(exchange)
                 reset_state()
                 continue
@@ -875,11 +904,17 @@ def monitor_loop():
                 # 1차 TP 전체 체결 확인
                 if tp_order_id:
                     tp_status = get_order_status(exchange, tp_order_id)
-                    if tp_status == "closed":
+                    _act = abs(float(position.get("contracts") or 0))
+                    with state_lock:
+                        _exp = state["expected_qty"]
+                    if tp_status == "closed" and _exp > 0 and _act >= _exp * 0.5:
+                        # 전량 익절이면 포지션이 사라져야 함 → 포지션이 그대로면 조회 오류로 보고 무시
+                        log.warning(f"⚠️ TP '체결' 응답이나 포지션 {_act:.4f}/{_exp:.4f} BTC 그대로 → 조회 오류로 보고 무시")
+                    elif tp_status == "closed":
                         log.info("🎉 1차 TP 전체 체결! → 2차 지정가 취소 → 처음부터 재시작")
                         with state_lock:
                             tp_tf = state["timeframe"]
-                        start_cooldown(tp_tf)
+                        cooldown_after_profit(tp_tf)
                         cancel_order_safe(exchange, limit_order_id)
                         cancel_all_open_orders(exchange)
                         reset_state()
@@ -898,6 +933,14 @@ def monitor_loop():
                 # 2차 지정가 체결 확인
                 if limit_order_id:
                     limit_status = get_order_status(exchange, limit_order_id)
+                    if limit_status == "closed":
+                        _act2 = abs(float(position.get("contracts") or 0))
+                        with state_lock:
+                            _exp2 = state["expected_qty"]
+                        if _exp2 > 0 and _act2 <= _exp2 * 1.2:
+                            # 2차가 체결됐다면 수량이 늘어야 함 → 그대로면 조회 오류로 보고 무시
+                            log.warning(f"⚠️ 2차 '체결' 응답이나 포지션 {_act2:.4f}/{_exp2:.4f} BTC 그대로 → 조회 오류로 보고 무시")
+                            limit_status = "open"
                     if limit_status == "closed":
                         log.info("✅ 2차 지정가 체결! → 1차 TP 취소 후 평균단가 기준 TP+SL 재설정")
 
@@ -1095,7 +1138,7 @@ def monitor_loop():
                         log.info("📉 본전 SL 체결 → 잔여 포지션 청산 완료")
                         with state_lock:
                             start_tf = state["timeframe"]
-                        start_cooldown(start_tf)
+                        cooldown_after_profit(start_tf)
                         cancel_all_open_orders(exchange)
                         reset_state()
                         continue
